@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Google Trends Monitor daily with randomized delay
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

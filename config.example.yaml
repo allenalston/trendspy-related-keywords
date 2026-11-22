@@ -1,0 +1,96 @@
+# =============================================================================
+# TrendSpy Related Keywords Monitor Configuration
+# Copy this file to `config.yaml` (or run `trends-monitor init`) and edit it.
+# Sensitive secrets (SMTP password, webhooks, proxy credentials) should go in `.env`.
+# =============================================================================
+
+# Fixed seed keywords to monitor
+keywords:
+  - "AI"
+  - "Image"
+  - "Video"
+  - "Music"
+  - "Voice"
+
+# Google Trends query parameters
+trends:
+  # Supported formats:
+  #   - "now 1-d"       (past 24 hours)
+  #   - "now 7-d"       (past 7 days - recommended default)
+  #   - "now 30-d"      (past 30 days)
+  #   - "today 3-m"     (past 3 months)
+  #   - "today 12-m"    (past 12 months)
+  #   - "last-3-d"      (dynamic date range for last N days)
+  #   - "2026-01-01 2026-01-07" (custom date range)
+  timeframe: "now 7-d"
+  # Country/region code: "" for Worldwide, "US", "GB", "JP", "DE", etc.
+  geo: ""
+  # Trends interface language code (e.g., "en", "zh")
+  language: "en"
+  # Optional HTTP/SOCKS proxy URL; can also be set via TRENDS_PROXY in .env
+  proxy: ""
+
+# Signal filtering & deduplication settings
+monitor:
+  # Minimum rising percentage to highlight in the report (e.g. 500 means +500%)
+  rising_threshold: 500
+  # Values >= breakout_threshold are labeled as Breakout (Google Trends uses 5000+)
+  breakout_threshold: 5000
+  # Days window to treat a previously recorded query as already seen.
+  # Set to 0 to treat any historically recorded query as seen forever.
+  dedup_days: 7
+  # Maximum rows shown per section in the digest report
+  max_items_per_section: 50
+
+# Rate limiting and retry policy (prevents infinite hangs on HTTP 429)
+rate_limit:
+  min_delay_seconds: 5.0
+  max_delay_seconds: 12.0
+  batch_size: 5
+  batch_interval_seconds: 60.0
+  max_retries: 3
+  quota_backoff_seconds: 60.0
+
+# Data persistence
+storage:
+  data_dir: "data"
+  db_path: "data/trends_history.sqlite3"
+  save_raw_json: true
+  save_csv: true
+
+# Notification channels (all optional; local output works out of the box)
+notifications:
+  local:
+    enabled: true
+    formats:
+      - "markdown"
+      - "html"
+
+  email:
+    enabled: false
+    # Leave blank to read from .env (TRENDS_SMTP_SERVER, TRENDS_SMTP_PORT, etc.)
+    smtp_server: ""
+    smtp_port: 587
+    # null = auto-detect (SSL for port 465, STARTTLS otherwise)
+    use_ssl: null
+    sender_email: ""
+    sender_password: ""
+    recipient_emails: []
+    attach_csv: true
+
+  feishu:
+    enabled: false
+    # Leave blank to read from TRENDS_FEISHU_WEBHOOK in .env
+    webhook_url: ""
+
+  wecom:
+    enabled: false
+    # Leave blank to read from TRENDS_WECOM_WEBHOOK in .env
+    webhook_url: ""
+
+  webhook:
+    enabled: false
+    # Generic JSON POST webhook (e.g., n8n, Zapier, custom server)
+    # Leave blank to read from TRENDS_WEBHOOK_URL in .env
+    url: ""
+    headers: {}

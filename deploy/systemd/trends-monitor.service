@@ -1,0 +1,12 @@
+[Unit]
+Description=Google Trends Rising Related Keywords Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Adjust WorkingDirectory and ExecStart to your installation path
+WorkingDirectory=/opt/trendspy-related-keywords
+ExecStart=/opt/trendspy-related-keywords/.venv/bin/trends-monitor run --config /opt/trendspy-related-keywords/config.yaml
+StandardOutput=journal
+StandardError=journal
