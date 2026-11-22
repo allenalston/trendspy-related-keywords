@@ -3,19 +3,48 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
+class KeywordSpec(BaseModel):
+    """Per-keyword monitoring target with optional overrides for geo, timeframe, and category."""
+
+    keyword: str
+    geo: str | None = None
+    timeframe: str | None = None
+    cat: int | None = Field(default=None, ge=0)
+
+    @field_validator("keyword")
+    @classmethod
+    def validate_keyword(cls, v: str) -> str:
+        cleaned = v.strip()
+        if not cleaned:
+            raise ValueError("Keyword cannot be empty")
+        return cleaned
+
+    @field_validator("geo")
+    @classmethod
+    def normalize_geo(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return v.strip().upper()
+
+
 class TrendsSettings(BaseModel):
+    provider: Literal["trendspy", "serpapi"] = "trendspy"
     timeframe: str = "now 7-d"
     geo: str = ""
+    cat: int = Field(default=0, ge=0)
     language: str = "en"
     proxy: str = ""
+    proxies: list[str] = Field(default_factory=list)
+    serpapi_api_key: str = ""
 
     @field_validator("geo")
     @classmethod
@@ -28,12 +57,47 @@ class TrendsSettings(BaseModel):
         cleaned = v.strip().lower()
         return cleaned if cleaned else "en"
 
+    @field_validator("proxies")
+    @classmethod
+    def clean_proxies(cls, v: list[str]) -> list[str]:
+        return [item.strip() for item in v if item and item.strip()]
+
+    @property
+    def resolved_proxies(self) -> list[str]:
+        """Deduplicated proxy pool merging `proxies` list and legacy single `proxy`."""
+        pool: list[str] = []
+        for candidate in [*self.proxies, self.proxy.strip()]:
+            if candidate and candidate not in pool:
+                pool.append(candidate)
+        return pool
+
 
 class MonitorSettings(BaseModel):
     rising_threshold: int = Field(default=500, ge=0)
     breakout_threshold: int = Field(default=5000, ge=100)
     dedup_days: int = Field(default=7, ge=0)
     max_items_per_section: int = Field(default=50, ge=1)
+
+
+class FilterSettings(BaseModel):
+    min_word_count: int = Field(default=1, ge=1)
+    exclude_patterns: list[str] = Field(default_factory=list)
+    include_patterns: list[str] = Field(default_factory=list)
+
+    @field_validator("exclude_patterns", "include_patterns")
+    @classmethod
+    def validate_regex_patterns(cls, patterns: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for pat in patterns:
+            text = str(pat).strip()
+            if not text:
+                continue
+            try:
+                re.compile(text, re.IGNORECASE)
+            except re.error as exc:
+                raise ValueError(f"Invalid regex filter pattern {text!r}: {exc}") from exc
+            cleaned.append(text)
+        return cleaned
 
 
 class RateLimitSettings(BaseModel):
@@ -115,27 +179,55 @@ class NotificationSettings(BaseModel):
 
 
 class AppConfig(BaseModel):
-    keywords: list[str] = Field(default_factory=lambda: ["AI", "Image", "Video", "Music", "Voice"])
+    keywords: list[str | KeywordSpec] = Field(
+        default_factory=lambda: ["AI", "Image", "Video", "Music", "Voice"]
+    )
     trends: TrendsSettings = Field(default_factory=TrendsSettings)
     monitor: MonitorSettings = Field(default_factory=MonitorSettings)
+    filters: FilterSettings = Field(default_factory=FilterSettings)
     rate_limit: RateLimitSettings = Field(default_factory=RateLimitSettings)
     storage: StorageSettings = Field(default_factory=StorageSettings)
     notifications: NotificationSettings = Field(default_factory=NotificationSettings)
 
-    @field_validator("keywords")
+    @field_validator("keywords", mode="before")
     @classmethod
-    def clean_keywords(cls, v: list[str]) -> list[str]:
+    def normalize_keywords_input(cls, v: Any) -> list[Any]:
+        if not isinstance(v, list):
+            raise ValueError("keywords must be a list of strings or keyword objects")
         seen: set[str] = set()
-        cleaned: list[str] = []
-        for kw in v:
-            item = str(kw).strip()
-            if item and item not in seen:
-                seen.add(item)
-                cleaned.append(item)
+        cleaned: list[Any] = []
+        for raw in v:
+            if isinstance(raw, str):
+                text = raw.strip()
+                if text and text not in seen:
+                    seen.add(text)
+                    cleaned.append(text)
+            elif isinstance(raw, KeywordSpec):
+                if raw.keyword not in seen:
+                    seen.add(raw.keyword)
+                    cleaned.append(raw)
+            elif isinstance(raw, dict):
+                spec = KeywordSpec.model_validate(raw)
+                if spec.keyword not in seen:
+                    seen.add(spec.keyword)
+                    cleaned.append(spec)
+            else:
+                raise ValueError(f"Unsupported keyword entry: {raw!r}")
         return cleaned
 
+    def get_keyword_specs(self) -> list[KeywordSpec]:
+        """Return all configured seed keywords normalized as KeywordSpec objects."""
+        specs: list[KeywordSpec] = []
+        seen: set[str] = set()
+        for item in self.keywords:
+            spec = item if isinstance(item, KeywordSpec) else KeywordSpec(keyword=str(item))
+            if spec.keyword not in seen:
+                seen.add(spec.keyword)
+                specs.append(spec)
+        return specs
 
-def _parse_recipients(raw: str) -> list[str]:
+
+def _parse_csv_env(raw: str) -> list[str]:
     return [part.strip() for part in raw.split(",") if part.strip()]
 
 
@@ -146,12 +238,20 @@ def _apply_env_fallbacks(config: AppConfig) -> AppConfig:
         if env_proxy:
             config.trends.proxy = env_proxy
 
+    if not config.trends.proxies:
+        env_proxies = os.getenv("TRENDS_PROXIES", "").strip()
+        if env_proxies:
+            config.trends.proxies = _parse_csv_env(env_proxies)
+
+    if not config.trends.serpapi_api_key:
+        env_serpapi = os.getenv("TRENDS_SERPAPI_KEY", "").strip()
+        if env_serpapi:
+            config.trends.serpapi_api_key = env_serpapi
+
     email = config.notifications.email
     if not email.smtp_server:
         email.smtp_server = os.getenv("TRENDS_SMTP_SERVER", "").strip()
     if env_port := os.getenv("TRENDS_SMTP_PORT", "").strip():
-        # Only override default port if config did not explicitly specify a custom one
-        # or if smtp_server was populated from env
         if email.smtp_port == 587 or not config.notifications.email.smtp_server:
             try:
                 email.smtp_port = int(env_port)
@@ -164,7 +264,7 @@ def _apply_env_fallbacks(config: AppConfig) -> AppConfig:
     if not email.recipient_emails:
         env_recipients = os.getenv("TRENDS_RECIPIENT_EMAIL", "").strip()
         if env_recipients:
-            email.recipient_emails = _parse_recipients(env_recipients)
+            email.recipient_emails = _parse_csv_env(env_recipients)
 
     if not config.notifications.feishu.webhook_url:
         config.notifications.feishu.webhook_url = os.getenv("TRENDS_FEISHU_WEBHOOK", "").strip()

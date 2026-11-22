@@ -25,7 +25,14 @@ class FakeCollector(TrendsCollector):
         self.responses = responses
         self.called: list[str] = []
 
-    def fetch_keyword(self, keyword: str, *, geo: str, timeframe: str) -> KeywordCollectionResult:
+    def fetch_keyword(
+        self,
+        keyword: str,
+        *,
+        geo: str,
+        timeframe: str,
+        cat: int = 0,
+    ) -> KeywordCollectionResult:
         self.called.append(keyword)
         return self.responses[keyword]
 

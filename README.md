@@ -14,11 +14,11 @@
 
 ## 核心特性
 
-- **零门槛上手**：默认生成本地 Markdown / HTML / CSV 报告，**不配邮箱、不配 Webhook 也能 3 分钟跑出结果**。
-- **跨天去重与「New」标记**：内置单文件 SQLite 历史库，优先高亮「✨ 今日新发现飙升词」，把老词降噪归入复现列表，告别每日刷屏。
-- **稳健防卡死与断点续跑**：内置有限次重试 + 指数退避 + 错误分类（`quota_exceeded` / `empty_response` / `network_error`）+ HTTP/SOCKS 代理支持；单个词失败自动跳过并在日报汇报，随时用 `--resume` 从中断处继续。
-- **合并单封精美日报**：一次采集只发**一封**汇总邮件（自动兼容 Gmail `587 STARTTLS` 与 QQ/163/企业邮箱 `465 SSL`），同时支持**飞书机器人、企业微信机器人、通用 JSON Webhook**，并支持 `notify` 命令一键重发历史日报。
-- **零服务器免费运行**：开箱即用的 **GitHub Actions 每日定时工作流**（自动缓存 SQLite 实现跨天去重）、Docker 与 `systemd` 定时模板。
+- **零门槛上手 + 场景词根预设**：默认生成本地 Markdown / HTML / CSV 报告，不配邮箱也能 3 分钟出结果；内置 `saas-tools`、`ai-products`、`ecommerce` 等经过验证的词根预设（`trends-monitor init --preset saas-tools`）。
+- **精准降噪（告别泛词和垃圾词）**：支持**单词根 Google Trends 行业分类 `cat`**（例如给 `Python` 指定 `cat: 31` 编程分类，彻底过滤“蟒蛇”）、**正则黑白名单过滤**与**最小词数限制**。
+- **跨天去重 + 零成本趋势动量标签**：内置单文件 SQLite 历史库，优先高亮 **✨ 今日新发现飙升词（New）**，并零额外请求自动计算 **🔥 连续飙升天数（Streak）** 与 **🚀 加速信号**；每条词附带 **Trends · Google · Exact** 一键验证直达链接。
+- **稳健防 429 与分片断点续跑**：支持**多代理自动轮换（`TRENDS_PROXIES`）**、**分片采集（`--limit N` 配合 `--resume`）**、有限次指数退避重试，以及可选商业数据源 **`provider: serpapi`**（重度用户填 Key 即享 0 限流）。
+- **合并单封精美日报 & 零服务器部署**：一次采集只发**一封**汇总邮件（自动兼容 `465 SSL` 与 `587 STARTTLS`），支持飞书 / 企业微信 / 通用 JSON Webhook，内置 GitHub Actions / Docker / `systemd` 模板。
 
 ---
 
@@ -53,15 +53,19 @@ trends-monitor run -k AI -k Python --timeframe "now 7-d"
 - `daily_report_YYYY-MM-DD.csv`（完整结构化数据）
 - `raw/related_queries_*.json`（单词根原始数据）
 
-### 3. 初始化正式配置
+### 3. 初始化正式配置（支持场景预设）
 
 ```bash
-trends-monitor init
+# 查看内置词根与降噪预设（default / saas-tools / ai-products / ecommerce）
+trends-monitor init --list-presets
+
+# 例如：用工具站/独立开发需求词根预设初始化
+trends-monitor init --preset saas-tools
 ```
 
 这会在当前目录生成：
-- `config.yaml`：维护监控词根、地区、时间窗口、阈值、限流策略和通知开关。
-- `.env`：存放敏感信息（代理地址、SMTP 密码、Webhook URL），已被 `.gitignore` 忽略。
+- `config.yaml`：维护监控词根（支持为单个词根配独立 `cat` 分类 / `geo` / `timeframe`）、过滤规则、限流策略和通知开关。
+- `.env`：存放敏感信息（代理池、SerpApi Key、SMTP 密码、Webhook URL），已被 `.gitignore` 忽略。
 
 验证配置与连通性：
 
@@ -79,14 +83,15 @@ trends-monitor check --live
 
 | 命令 | 说明 |
 | --- | --- |
-| `trends-monitor init` | 生成 `config.yaml` 和 `.env` 模板 |
-| `trends-monitor run` | 按配置执行一次完整采集、去重并发送日报 |
-| `trends-monitor run -k AI -k Video --geo US` | 临时指定词根和地区运行（支持重复 `-k`） |
-| `trends-monitor run --resume` | 从上一次中断或部分失败的任务继续，只补跑未成功词根 |
+| `trends-monitor init [--preset saas-tools]` | 使用内置预设生成 `config.yaml` 和 `.env`（`--list-presets` 查看全部） |
+| `trends-monitor run` | 按配置执行一次完整采集、去重、过滤并发送日报 |
+| `trends-monitor run -k Python --geo US --cat 31` | 临时指定词根、地区和行业分类运行（支持重复 `-k`） |
+| `trends-monitor run --limit 15` | 分片采集：本次最多跑 15 个词根，剩余留作 pending 供下次 `--resume` |
+| `trends-monitor run --resume` | 从上一次中断、分片或部分失败的任务继续，只补跑未成功词根 |
 | `trends-monitor run --no-notify` | 仅采集并输出本地报告，跳过邮件和 Webhook 推送 |
-| `trends-monitor check [--live]` | 检查配置、SMTP 登录、Webhook 与 Google Trends 连通性 |
+| `trends-monitor check [--live]` | 检查配置、数据源 Provider、SMTP 登录、Webhook 与 Trends 连通性 |
 | `trends-monitor notify [--date YYYY-MM-DD]` | 不重新抓数据，直接从历史库重发某天日报 |
-| `trends-monitor history --new-only --limit 30` | 在终端查看历史新发现飙升词（支持 `--export out.csv`） |
+| `trends-monitor history --min-streak 2 --new-only` | 在终端筛选连续飙升或新发现历史词（支持 `--export out.csv`） |
 
 ---
 

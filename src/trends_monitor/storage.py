@@ -1,4 +1,4 @@
-"""SQLite historical store, deduplication engine, resume checkpointing, and raw/CSV export."""
+"""SQLite historical store, deduplication/streak engine, resume checkpointing, and raw/CSV export."""
 
 from __future__ import annotations
 
@@ -10,10 +10,12 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from trends_monitor.filters import QueryFilter
 from trends_monitor.models import (
     FailedKeywordItem,
     KeywordCollectionResult,
     KeywordStatus,
+    KeywordTarget,
     QueryType,
     RisingSignal,
     RunReport,
@@ -45,6 +47,10 @@ CREATE TABLE IF NOT EXISTS run_keywords (
     rising_count INTEGER NOT NULL DEFAULT 0,
     top_count INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL,
+    geo TEXT NOT NULL DEFAULT '',
+    timeframe TEXT NOT NULL DEFAULT '',
+    resolved_timeframe TEXT NOT NULL DEFAULT '',
+    cat INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (run_id, keyword),
     FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
 );
@@ -63,7 +69,9 @@ CREATE TABLE IF NOT EXISTS observations (
     is_breakout INTEGER NOT NULL DEFAULT 0,
     is_new INTEGER NOT NULL DEFAULT 0,
     seen_count INTEGER NOT NULL DEFAULT 1,
+    previous_value INTEGER,
     previous_max_value INTEGER,
+    consecutive_days INTEGER NOT NULL DEFAULT 1,
     first_seen_date TEXT,
     FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
 );
@@ -83,11 +91,23 @@ CREATE TABLE IF NOT EXISTS seen_queries (
     last_seen_at TEXT NOT NULL,
     last_seen_date TEXT NOT NULL,
     seen_count INTEGER NOT NULL DEFAULT 1,
+    consecutive_days INTEGER NOT NULL DEFAULT 1,
     max_value INTEGER NOT NULL DEFAULT 0,
     last_value INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (keyword, geo, query_type, query_normalized)
 );
 """
+
+# Backward-compatible schema migrations for databases created by v0.2.0
+MIGRATIONS: list[tuple[str, str, str]] = [
+    ("run_keywords", "geo", "TEXT NOT NULL DEFAULT ''"),
+    ("run_keywords", "timeframe", "TEXT NOT NULL DEFAULT ''"),
+    ("run_keywords", "resolved_timeframe", "TEXT NOT NULL DEFAULT ''"),
+    ("run_keywords", "cat", "INTEGER NOT NULL DEFAULT 0"),
+    ("observations", "previous_value", "INTEGER"),
+    ("observations", "consecutive_days", "INTEGER NOT NULL DEFAULT 1"),
+    ("seen_queries", "consecutive_days", "INTEGER NOT NULL DEFAULT 1"),
+]
 
 
 def utc_now_iso() -> str:
@@ -107,6 +127,7 @@ def save_raw_json(
     *,
     geo: str,
     timeframe: str,
+    cat: int = 0,
 ) -> Path:
     """Persist raw collected records for a single keyword to JSON."""
     raw_dir = output_dir / "raw"
@@ -117,6 +138,7 @@ def save_raw_json(
         "keyword": result.keyword,
         "geo": geo,
         "timeframe": timeframe,
+        "cat": cat,
         "collected_at": utc_now_iso(),
         "status": result.status.value,
         "related_queries": {
@@ -142,7 +164,7 @@ def save_raw_json(
 
 
 class SQLiteStore:
-    """SQLite-backed state store supporting deduplication, resume, and historical queries."""
+    """SQLite-backed state store supporting deduplication, streaks, resume, and history."""
 
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
@@ -158,19 +180,46 @@ class SQLiteStore:
     def _init_schema(self) -> None:
         with self._connect() as conn:
             conn.executescript(SCHEMA_SQL)
+            self._migrate_schema(conn)
+
+    def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        existing_cols_cache: dict[str, set[str]] = {}
+        for table, column, ddl in MIGRATIONS:
+            if table not in existing_cols_cache:
+                rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+                existing_cols_cache[table] = {str(r["name"]) for r in rows}
+            if column not in existing_cols_cache[table]:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+                existing_cols_cache[table].add(column)
 
     def create_run(
         self,
         *,
         run_id: str,
         run_date: str,
-        keywords: list[str],
+        keywords: list[str] | None = None,
+        targets: list[KeywordTarget] | None = None,
         timeframe: str,
         resolved_timeframe: str,
         geo: str,
         rising_threshold: int,
     ) -> None:
         now = utc_now_iso()
+        resolved_targets = (
+            list(targets)
+            if targets is not None
+            else [
+                KeywordTarget(
+                    keyword=kw,
+                    geo=geo,
+                    timeframe=timeframe,
+                    resolved_timeframe=resolved_timeframe,
+                    cat=0,
+                )
+                for kw in (keywords or [])
+            ]
+        )
+
         with self._connect() as conn:
             conn.execute(
                 """
@@ -188,15 +237,30 @@ class SQLiteStore:
                     resolved_timeframe,
                     geo,
                     rising_threshold,
-                    len(keywords),
+                    len(resolved_targets),
                 ),
             )
             conn.executemany(
                 """
-                INSERT INTO run_keywords (run_id, keyword, position, status, updated_at)
-                VALUES (?, ?, ?, 'pending', ?)
+                INSERT INTO run_keywords (
+                    run_id, keyword, position, status, updated_at,
+                    geo, timeframe, resolved_timeframe, cat
+                )
+                VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?)
                 """,
-                [(run_id, kw, idx, now) for idx, kw in enumerate(keywords)],
+                [
+                    (
+                        run_id,
+                        t.keyword,
+                        idx,
+                        now,
+                        t.geo,
+                        t.timeframe,
+                        t.resolved_timeframe,
+                        t.cat,
+                    )
+                    for idx, t in enumerate(resolved_targets)
+                ],
             )
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
@@ -229,17 +293,44 @@ class SQLiteStore:
                 ).fetchone()
             return dict(row) if row else None
 
-    def get_pending_keywords(self, run_id: str) -> list[str]:
+    def get_pending_targets(self, run_id: str) -> list[KeywordTarget]:
+        """Return unfinished KeywordTarget items (pending or failed) for resume."""
         with self._connect() as conn:
+            run = conn.execute(
+                "SELECT geo, timeframe, resolved_timeframe FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if run is None:
+                return []
             rows = conn.execute(
                 """
-                SELECT keyword FROM run_keywords
+                SELECT keyword, geo, timeframe, resolved_timeframe, cat
+                FROM run_keywords
                 WHERE run_id = ? AND status != 'success'
                 ORDER BY position ASC
                 """,
                 (run_id,),
             ).fetchall()
-            return [row["keyword"] for row in rows]
+
+        targets: list[KeywordTarget] = []
+        for row in rows:
+            # Handle legacy v0.2.0 rows where per-keyword fields default to ''
+            tf = str(row["timeframe"] or run["timeframe"])
+            rtf = str(row["resolved_timeframe"] or run["resolved_timeframe"])
+            geo = str(row["geo"]) if row["timeframe"] else str(run["geo"])
+            targets.append(
+                KeywordTarget(
+                    keyword=str(row["keyword"]),
+                    geo=geo,
+                    timeframe=tf,
+                    resolved_timeframe=rtf,
+                    cat=int(row["cat"] or 0),
+                )
+            )
+        return targets
+
+    def get_pending_keywords(self, run_id: str) -> list[str]:
+        return [t.keyword for t in self.get_pending_targets(run_id)]
 
     def record_keyword_result(
         self,
@@ -287,7 +378,8 @@ class SQLiteStore:
                     norm_query = rec.query.strip().lower()
                     existing = conn.execute(
                         """
-                        SELECT first_seen_date, last_seen_date, seen_count, max_value
+                        SELECT first_seen_date, last_seen_date, seen_count,
+                               consecutive_days, max_value, last_value
                         FROM seen_queries
                         WHERE keyword = ? AND geo = ? AND query_type = ? AND query_normalized = ?
                         """,
@@ -297,6 +389,8 @@ class SQLiteStore:
                     if existing is None:
                         is_new = True
                         new_seen_count = 1
+                        new_streak = 1
+                        prev_val: int | None = None
                         prev_max: int | None = None
                         first_seen_date = run_date
                         conn.execute(
@@ -304,9 +398,9 @@ class SQLiteStore:
                             INSERT INTO seen_queries (
                                 keyword, geo, query_type, query_normalized, display_query,
                                 first_seen_at, first_seen_date, last_seen_at, last_seen_date,
-                                seen_count, max_value, last_value
+                                seen_count, consecutive_days, max_value, last_value
                             )
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?)
                             """,
                             (
                                 result.keyword,
@@ -327,6 +421,14 @@ class SQLiteStore:
                         days_since = (run_date_obj - prev_last_date).days
                         is_new = dedup_days > 0 and days_since > dedup_days
                         new_seen_count = int(existing["seen_count"]) + 1
+                        prev_streak = int(existing["consecutive_days"] or 1)
+                        if days_since == 1:
+                            new_streak = prev_streak + 1
+                        elif days_since == 0:
+                            new_streak = prev_streak
+                        else:
+                            new_streak = 1
+                        prev_val = int(existing["last_value"])
                         prev_max = int(existing["max_value"])
                         first_seen_date = str(existing["first_seen_date"])
                         updated_max = max(prev_max, rec.value)
@@ -334,7 +436,7 @@ class SQLiteStore:
                             """
                             UPDATE seen_queries
                             SET display_query = ?, last_seen_at = ?, last_seen_date = ?,
-                                seen_count = ?, max_value = ?, last_value = ?
+                                seen_count = ?, consecutive_days = ?, max_value = ?, last_value = ?
                             WHERE keyword = ? AND geo = ? AND query_type = ? AND query_normalized = ?
                             """,
                             (
@@ -342,6 +444,7 @@ class SQLiteStore:
                                 now,
                                 run_date,
                                 new_seen_count,
+                                new_streak,
                                 updated_max,
                                 rec.value,
                                 result.keyword,
@@ -356,9 +459,10 @@ class SQLiteStore:
                         INSERT INTO observations (
                             run_id, run_date, observed_at, keyword, geo, timeframe,
                             query_type, related_query, value, is_breakout,
-                            is_new, seen_count, previous_max_value, first_seen_date
+                            is_new, seen_count, previous_value, previous_max_value,
+                            consecutive_days, first_seen_date
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             run_id,
@@ -373,7 +477,9 @@ class SQLiteStore:
                             1 if rec.is_breakout else 0,
                             1 if is_new else 0,
                             new_seen_count,
+                            prev_val,
                             prev_max,
+                            new_streak,
                             first_seen_date,
                         ),
                     )
@@ -440,12 +546,14 @@ class SQLiteStore:
             rows = conn.execute(
                 """
                 SELECT keyword, related_query, query_type, value, is_breakout,
-                       is_new, seen_count, previous_max_value, geo, timeframe, observed_at
+                       is_new, seen_count, consecutive_days, previous_value,
+                       previous_max_value, geo, timeframe, observed_at
                 FROM observations
                 WHERE run_id = ?
                 ORDER BY
                     CASE WHEN query_type = 'rising' THEN 0 ELSE 1 END,
                     is_new DESC,
+                    consecutive_days DESC,
                     value DESC,
                     keyword ASC
                 """,
@@ -464,6 +572,8 @@ class SQLiteStore:
             "is_breakout",
             "is_new",
             "seen_count",
+            "consecutive_days",
+            "previous_value",
             "previous_max_value",
             "geo",
             "timeframe",
@@ -482,6 +592,8 @@ class SQLiteStore:
                         bool(row["is_breakout"]),
                         bool(row["is_new"]),
                         row["seen_count"],
+                        int(row["consecutive_days"] or 1),
+                        "" if row["previous_value"] is None else row["previous_value"],
                         "" if row["previous_max_value"] is None else row["previous_max_value"],
                         row["geo"],
                         row["timeframe"],
@@ -495,6 +607,7 @@ class SQLiteStore:
         run_id: str,
         *,
         max_items_per_section: int = 50,
+        query_filter: QueryFilter | None = None,
         csv_path: Path | None = None,
         output_dir: Path | None = None,
     ) -> RunReport:
@@ -506,13 +619,14 @@ class SQLiteStore:
 
             rising_rows = conn.execute(
                 """
-                SELECT keyword, related_query, value, is_breakout, is_new,
-                       seen_count, previous_max_value, first_seen_date
+                SELECT keyword, related_query, value, is_breakout, is_new, geo,
+                       seen_count, consecutive_days, previous_value,
+                       previous_max_value, first_seen_date
                 FROM observations
                 WHERE run_id = ?
                   AND query_type = ?
                   AND (value >= ? OR is_breakout = 1)
-                ORDER BY is_new DESC, is_breakout DESC, value DESC, keyword ASC
+                ORDER BY is_new DESC, is_breakout DESC, consecutive_days DESC, value DESC, keyword ASC
                 """,
                 (run_id, QueryType.RISING.value, int(run["rising_threshold"])),
             ).fetchall()
@@ -521,23 +635,31 @@ class SQLiteStore:
                 """
                 SELECT keyword, error_type, error_message
                 FROM run_keywords
-                WHERE run_id = ? AND status != 'success'
+                WHERE run_id = ? AND status = 'failed'
                 ORDER BY position ASC
                 """,
                 (run_id,),
             ).fetchall()
 
-        new_rising: list[RisingSignal] = []
-        recurring_rising: list[RisingSignal] = []
+            pending_row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM run_keywords WHERE run_id = ? AND status = 'pending'",
+                (run_id,),
+            ).fetchone()
+            pending_count = int(pending_row["cnt"] or 0)
 
-        for row in rising_rows:
-            signal = RisingSignal(
-                keyword=row["keyword"],
-                related_query=row["related_query"],
+        all_signals = [
+            RisingSignal(
+                keyword=str(row["keyword"]),
+                related_query=str(row["related_query"]),
                 value=int(row["value"]),
                 is_breakout=bool(row["is_breakout"]),
                 is_new=bool(row["is_new"]),
+                geo=str(row["geo"] or run["geo"]),
                 seen_count=int(row["seen_count"]),
+                consecutive_days=int(row["consecutive_days"] or 1),
+                previous_value=(
+                    int(row["previous_value"]) if row["previous_value"] is not None else None
+                ),
                 previous_max_value=(
                     int(row["previous_max_value"])
                     if row["previous_max_value"] is not None
@@ -545,6 +667,17 @@ class SQLiteStore:
                 ),
                 first_seen_date=row["first_seen_date"],
             )
+            for row in rising_rows
+        ]
+
+        filtered_count = 0
+        if query_filter is not None:
+            all_signals, filtered_count = query_filter.filter_signals(all_signals)
+
+        new_rising: list[RisingSignal] = []
+        recurring_rising: list[RisingSignal] = []
+
+        for signal in all_signals:
             if signal.is_new:
                 if len(new_rising) < max_items_per_section:
                     new_rising.append(signal)
@@ -554,9 +687,9 @@ class SQLiteStore:
 
         failures = [
             FailedKeywordItem(
-                keyword=row["keyword"],
-                error_type=row["error_type"] or "pending",
-                error_message=row["error_message"] or "Not completed",
+                keyword=str(row["keyword"]),
+                error_type=str(row["error_type"] or "unknown_error"),
+                error_message=str(row["error_message"] or "Failed"),
             )
             for row in failed_rows
         ]
@@ -572,6 +705,8 @@ class SQLiteStore:
             total_keywords=int(run["total_keywords"]),
             succeeded_keywords=int(run["succeeded_keywords"]),
             failed_keywords=int(run["failed_keywords"]),
+            pending_keywords=pending_count,
+            filtered_count=filtered_count,
             new_rising=new_rising,
             recurring_rising=recurring_rising,
             failures=failures,
@@ -585,6 +720,7 @@ class SQLiteStore:
         keyword: str | None = None,
         new_only: bool = False,
         min_value: int | None = None,
+        min_streak: int | None = None,
         limit: int = 30,
     ) -> list[dict[str, Any]]:
         """Query historical rising observations for CLI inspection or export."""
@@ -599,14 +735,17 @@ class SQLiteStore:
         if min_value is not None:
             clauses.append("(value >= ? OR is_breakout = 1)")
             params.append(min_value)
+        if min_streak is not None:
+            clauses.append("consecutive_days >= ?")
+            params.append(min_streak)
 
         params.append(limit)
         sql = f"""
             SELECT run_date, keyword, related_query, value, is_breakout,
-                   is_new, seen_count, geo, timeframe
+                   is_new, seen_count, consecutive_days, previous_value, geo, timeframe
             FROM observations
             WHERE {' AND '.join(clauses)}
-            ORDER BY run_date DESC, is_new DESC, value DESC
+            ORDER BY run_date DESC, is_new DESC, consecutive_days DESC, value DESC
             LIMIT ?
         """
         with self._connect() as conn:

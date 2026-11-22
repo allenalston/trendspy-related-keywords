@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-11-22
+
+### Added
+- **Per-keyword category/region/timeframe overrides**: `keywords` now accepts both simple strings and structured objects (`{keyword, cat, geo, timeframe}`), e.g., monitoring `"Python"` with `cat: 31` (Programming) to eliminate unrelated noise.
+- **Noise-reduction filter engine (`filters`)**: Case-insensitive regex `exclude_patterns`, optional `include_patterns` whitelist, and `min_word_count` filtering, with filtered noise counts summarized in the digest.
+- **Zero-API-cost momentum signals**: Local SQLite history now tracks `consecutive_days` (`🔥 3d streak`) and growth acceleration (`🚀 +500%→+2,400%`) without extra Google Trends requests, plus `trends-monitor history --min-streak`.
+- **Built-in starter presets**: `trends-monitor init --preset <name>` (`default`, `saas-tools`, `ai-products`, `ecommerce`) and `--list-presets`.
+- **Quick-decision links in digests**: Every rising query includes one-click **Trends · Google · Exact** links for 3-second opportunity & SERP competition checks.
+- **Proxy pool rotation & sharded execution**: Support for `trends.proxies` / `TRENDS_PROXIES` auto-rotation on 429/network errors, and `trends-monitor run --limit N` paired with `--resume` to spread large keyword lists across multiple runs.
+- **Optional SerpApi provider**: Pluggable `trends.provider: "serpapi"` (`TRENDS_SERPAPI_KEY`) for heavy users who want zero Google 429 interruptions.
+- **Automatic SQLite schema migration**: Seamless in-place upgrade for existing v0.2.0 `trends_history.sqlite3` databases.
+
 ## [0.2.0] - 2026-11-22
 
 ### Added

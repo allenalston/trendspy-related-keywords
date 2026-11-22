@@ -14,11 +14,11 @@ Built around one focused workflow: **Fixed seed keywords → Reliable collection
 
 ## Key Features
 
-- **Zero-Friction Quickstart**: Generates local Markdown, HTML, and CSV reports out of the box—no SMTP or webhook setup required to test.
-- **Cross-Day Deduplication (`New` Signals)**: Backed by a single-file SQLite database (`data/trends_history.sqlite3`). Newly observed rising queries are surfaced first while recurring ones are grouped with historical context.
-- **Resilient Collection & Checkpointing**: Bounded retries with exponential backoff, structured error classification (`quota_exceeded`, `empty_response`, `network_error`), HTTP/SOCKS proxy support, and `--resume` support so partial HTTP 429 failures never waste completed work.
-- **Single Consolidated Digest**: Sends **one** clean HTML + plain-text email per run (auto-supports both `465 SSL` and `587 STARTTLS` with optional CSV attachment), plus **Feishu (Lark), WeCom, and generic JSON Webhook** notifiers. Re-send any past digest with `trends-monitor notify`.
-- **Serverless & Self-Hosted Ready**: Includes a turnkey **GitHub Actions daily workflow** (with Actions Cache SQLite persistence), Dockerfile, and `systemd` timer templates.
+- **Zero-Friction Quickstart & Built-in Presets**: Generates local Markdown, HTML, and CSV reports out of the box—no SMTP required. Bootstrap proven seed roots in one command (`trends-monitor init --preset saas-tools`, `ai-products`, or `ecommerce`).
+- **High Signal-to-Noise Filtering**: Supports per-keyword **Google Trends category (`cat`)**, region, and timeframe overrides (e.g., `Python` with `cat: 31` Programming to eliminate snake queries), plus regex `exclude_patterns` / `include_patterns` and `min_word_count`.
+- **Cross-Day Deduplication & Zero-API Momentum Badges**: Single-file SQLite history surfaces **✨ New** rising queries first and computes **🔥 Streak (`3d`)** and **🚀 Accelerating** momentum tags locally with zero extra requests—paired with one-click **Trends · Google · Exact** verification links.
+- **Anti-429 Resilience & Pluggable Providers**: Supports **proxy pool rotation** (`TRENDS_PROXIES`), **sharded execution** (`--limit N` + `--resume`), bounded exponential backoff, and an optional commercial **`provider: serpapi`** (`TRENDS_SERPAPI_KEY`) for zero-429 production monitoring.
+- **Single Consolidated Digest & Turnkey Deployment**: Sends **one** HTML + plain-text email (`465 SSL` & `587 STARTTLS`), Feishu, WeCom, or Generic Webhook; ships with GitHub Actions, Docker, and `systemd` templates.
 
 ---
 
@@ -66,14 +66,15 @@ trends-monitor check --live
 
 | Command | Description |
 | --- | --- |
-| `trends-monitor init` | Create starter `config.yaml` and `.env` |
-| `trends-monitor run` | Collect keywords, deduplicate against history, export & notify |
-| `trends-monitor run -k AI -k Video --geo US` | Override seed keywords and region for a quick run |
-| `trends-monitor run --resume` | Resume the latest incomplete run (only retries unfinished keywords) |
+| `trends-monitor init [--preset saas-tools]` | Create starter `config.yaml` and `.env` from a preset (`--list-presets`) |
+| `trends-monitor run` | Collect keywords, deduplicate & filter against history, export & notify |
+| `trends-monitor run -k Python --geo US --cat 31` | Override seed keywords, region, and Google Trends category |
+| `trends-monitor run --limit 15` | Process at most 15 pending keywords in this pass (continue later with `--resume`) |
+| `trends-monitor run --resume` | Resume the latest incomplete/sharded run (only processes unfinished keywords) |
 | `trends-monitor run --no-notify` | Skip external email/webhook channels while saving local reports |
-| `trends-monitor check [--live]` | Validate config, SQLite path, notifiers, and optional live Trends access |
+| `trends-monitor check [--live]` | Validate config, provider, SQLite path, notifiers, and optional live Trends access |
 | `trends-monitor notify [--date YYYY-MM-DD]` | Re-send a stored run's digest without re-querying Google Trends |
-| `trends-monitor history --new-only --limit 30` | Inspect historical rising queries (supports `--export out.csv`) |
+| `trends-monitor history --min-streak 2 --new-only` | Inspect streaking or newly discovered rising queries (`--export out.csv`) |
 
 ---
 

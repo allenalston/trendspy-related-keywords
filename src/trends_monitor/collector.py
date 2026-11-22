@@ -1,4 +1,4 @@
-"""Google Trends data collector with bounded retries, error classification, and proxy support."""
+"""Google Trends collectors (trendspy with proxy pool + optional SerpApi provider)."""
 
 from __future__ import annotations
 
@@ -31,6 +31,8 @@ DEFAULT_REFERERS = [
     "https://trends.google.com/trends/explore",
 ]
 
+SERPAPI_ENDPOINT = "https://serpapi.com/search.json"
+
 
 def resolve_timeframe(timeframe: str, now: datetime | None = None) -> str:
     """Resolve dynamic timeframe shortcuts such as `last-3-d` into Google Trends date ranges."""
@@ -53,6 +55,9 @@ def classify_error(exc: Exception) -> ErrorType:
     """Classify collector exceptions into actionable error categories."""
     exc_name = type(exc).__name__.lower()
     msg = str(exc).lower()
+
+    if any(token in msg for token in ("401", "403", "invalid api key", "unauthorized")):
+        return ErrorType.AUTH_ERROR
 
     if "quota" in exc_name or "quota exceeded" in msg or "429" in msg or "too many requests" in msg:
         return ErrorType.QUOTA_EXCEEDED
@@ -125,33 +130,69 @@ def parse_related_dataframe(
 class TrendsCollector(ABC):
     """Abstract interface for fetching related queries."""
 
+    provider_name: str = "base"
+
     @abstractmethod
-    def fetch_keyword(self, keyword: str, *, geo: str, timeframe: str) -> KeywordCollectionResult:
+    def fetch_keyword(
+        self,
+        keyword: str,
+        *,
+        geo: str,
+        timeframe: str,
+        cat: int = 0,
+    ) -> KeywordCollectionResult:
         """Fetch top and rising related queries for a single keyword."""
+
+    def check(self) -> tuple[bool, str]:
+        """Validate provider configuration without spending quota."""
+        return True, f"Provider `{self.provider_name}` ready"
 
 
 class TrendspyCollector(TrendsCollector):
-    """Production collector backed by `trendspy` with bounded retries and backoff."""
+    """Free collector backed by `trendspy` with bounded retries and proxy-pool rotation."""
+
+    provider_name = "trendspy"
 
     def __init__(
         self,
         config: AppConfig,
         *,
-        client_factory: Callable[[], Any] | None = None,
+        client_factory: Callable[[str | None], Any] | Callable[[], Any] | None = None,
         sleep_fn: Callable[[float], None] = time.sleep,
     ) -> None:
         self.config = config
         self._sleep = sleep_fn
-        self._client_factory = client_factory or self._create_client
-        self._client = self._client_factory()
+        self._proxies = config.trends.resolved_proxies
+        self._proxy_index = 0
+        self._client_factory = client_factory
+        self._client = self._instantiate_client(self._current_proxy())
 
-    def _create_client(self) -> Trends:
-        proxy = self.config.trends.proxy.strip() or None
+    def _current_proxy(self) -> str | None:
+        if not self._proxies:
+            return None
+        return self._proxies[self._proxy_index % len(self._proxies)]
+
+    def _rotate_proxy(self) -> str | None:
+        if len(self._proxies) > 1:
+            self._proxy_index = (self._proxy_index + 1) % len(self._proxies)
+            logger.info(
+                "Rotated to proxy #%d/%d",
+                self._proxy_index + 1,
+                len(self._proxies),
+            )
+        return self._current_proxy()
+
+    def _instantiate_client(self, proxy: str | None) -> Any:
+        if self._client_factory is not None:
+            try:
+                return self._client_factory(proxy)  # type: ignore[call-arg]
+            except TypeError:
+                return self._client_factory()  # type: ignore[call-arg]
         return Trends(
             language=self.config.trends.language,
             # Keep a polite delay between trendspy's internal token + widget sub-requests
             request_delay=2.0,
-            max_retries=1,  # Bounded retry and backoff are controlled here
+            max_retries=1,
             proxy=proxy,
         )
 
@@ -160,7 +201,22 @@ class TrendspyCollector(TrendsCollector):
             "referer": random.choice(DEFAULT_REFERERS),
         }
 
-    def fetch_keyword(self, keyword: str, *, geo: str, timeframe: str) -> KeywordCollectionResult:
+    def check(self) -> tuple[bool, str]:
+        proxy_info = (
+            f"{len(self._proxies)} proxy endpoint(s) configured"
+            if self._proxies
+            else "direct connection (no proxy)"
+        )
+        return True, f"Provider `trendspy` ready ({proxy_info})"
+
+    def fetch_keyword(
+        self,
+        keyword: str,
+        *,
+        geo: str,
+        timeframe: str,
+        cat: int = 0,
+    ) -> KeywordCollectionResult:
         max_retries = self.config.rate_limit.max_retries
         breakout_threshold = self.config.monitor.breakout_threshold
         last_error_type = ErrorType.UNKNOWN_ERROR
@@ -172,6 +228,7 @@ class TrendspyCollector(TrendsCollector):
                     keyword,
                     timeframe=timeframe,
                     geo=geo,
+                    cat=cat,
                     headers=self._build_headers(),
                 )
                 if raw is None or not isinstance(raw, dict):
@@ -208,11 +265,15 @@ class TrendspyCollector(TrendsCollector):
                 )
 
                 if attempt < max_retries:
-                    backoff = self._compute_backoff(last_error_type, attempt)
+                    rotated_proxy = self._rotate_proxy()
+                    backoff = self._compute_backoff(
+                        last_error_type,
+                        attempt,
+                        has_proxy_pool=len(self._proxies) > 1,
+                    )
                     logger.info("Backing off %.1fs before retrying %r", backoff, keyword)
                     self._sleep(backoff)
-                    # Refresh session cookies on retry
-                    self._client = self._client_factory()
+                    self._client = self._instantiate_client(rotated_proxy)
 
         return KeywordCollectionResult(
             keyword=keyword,
@@ -222,11 +283,191 @@ class TrendspyCollector(TrendsCollector):
             attempts=max_retries,
         )
 
-    def _compute_backoff(self, error_type: ErrorType, attempt: int) -> float:
+    def _compute_backoff(
+        self,
+        error_type: ErrorType,
+        attempt: int,
+        *,
+        has_proxy_pool: bool = False,
+    ) -> float:
         base = self.config.rate_limit.quota_backoff_seconds
         jitter = random.uniform(0.0, 5.0)
         if error_type == ErrorType.QUOTA_EXCEEDED:
+            if has_proxy_pool:
+                # Shorter backoff when rotating to a fresh proxy IP
+                return min(base, 10.0) + jitter
             return base * (2 ** (attempt - 1)) + jitter
         if error_type == ErrorType.EMPTY_RESPONSE:
             return min(base, 15.0) * attempt + jitter
         return 5.0 * (2 ** (attempt - 1)) + jitter
+
+
+class SerpApiCollector(TrendsCollector):
+    """Commercial-grade Google Trends collector via SerpApi (zero Google 429 headaches)."""
+
+    provider_name = "serpapi"
+
+    def __init__(
+        self,
+        config: AppConfig,
+        *,
+        sleep_fn: Callable[[float], None] = time.sleep,
+        timeout: int = 30,
+    ) -> None:
+        self.config = config
+        self._sleep = sleep_fn
+        self.timeout = timeout
+
+    def check(self) -> tuple[bool, str]:
+        if not self.config.trends.serpapi_api_key:
+            return False, "Missing SerpApi key (set trends.serpapi_api_key or TRENDS_SERPAPI_KEY)"
+        return True, "Provider `serpapi` API key configured"
+
+    def _parse_serpapi_items(
+        self,
+        items: Any,
+        query_type: QueryType,
+        breakout_threshold: int,
+    ) -> list[QueryRecord]:
+        if not isinstance(items, list):
+            return []
+        records: list[QueryRecord] = []
+        for entry in items:
+            if not isinstance(entry, dict):
+                continue
+            query_text = str(entry.get("query", "")).strip()
+            if not query_text:
+                continue
+            raw_val = entry.get("value")
+            if raw_val is None or str(raw_val).strip() == "":
+                raw_val = entry.get("extracted_value", 0)
+            # SerpApi reports "Breakout" in `value` and may set `extracted_value: 5000`
+            value, is_breakout = parse_trend_value(raw_val, breakout_threshold=breakout_threshold)
+            extracted = entry.get("extracted_value")
+            if isinstance(extracted, (int, float)) and extracted > value:
+                value = int(round(extracted))
+                if value >= breakout_threshold:
+                    is_breakout = True
+            records.append(
+                QueryRecord(
+                    query=query_text,
+                    value=value,
+                    query_type=query_type,
+                    is_breakout=is_breakout if query_type == QueryType.RISING else False,
+                )
+            )
+        return records
+
+    def fetch_keyword(
+        self,
+        keyword: str,
+        *,
+        geo: str,
+        timeframe: str,
+        cat: int = 0,
+    ) -> KeywordCollectionResult:
+        api_key = self.config.trends.serpapi_api_key
+        if not api_key:
+            return KeywordCollectionResult(
+                keyword=keyword,
+                status=KeywordStatus.FAILED,
+                error_type=ErrorType.AUTH_ERROR,
+                error_message="Missing SerpApi key (set TRENDS_SERPAPI_KEY)",
+                attempts=1,
+            )
+
+        max_retries = self.config.rate_limit.max_retries
+        breakout_threshold = self.config.monitor.breakout_threshold
+        params: dict[str, Any] = {
+            "engine": "google_trends",
+            "q": keyword,
+            "data_type": "RELATED_QUERIES",
+            "date": timeframe,
+            "hl": self.config.trends.language,
+            "api_key": api_key,
+        }
+        if geo:
+            params["geo"] = geo
+        if cat:
+            params["cat"] = str(cat)
+
+        last_error_type = ErrorType.UNKNOWN_ERROR
+        last_error_msg = ""
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                resp = requests.get(SERPAPI_ENDPOINT, params=params, timeout=self.timeout)
+                if resp.status_code in (401, 403):
+                    return KeywordCollectionResult(
+                        keyword=keyword,
+                        status=KeywordStatus.FAILED,
+                        error_type=ErrorType.AUTH_ERROR,
+                        error_message=f"SerpApi authentication failed (HTTP {resp.status_code})",
+                        attempts=attempt,
+                    )
+                resp.raise_for_status()
+                payload = resp.json()
+                if "error" in payload:
+                    err_text = str(payload["error"])
+                    err_type = classify_error(RuntimeError(err_text))
+                    if err_type == ErrorType.AUTH_ERROR:
+                        return KeywordCollectionResult(
+                            keyword=keyword,
+                            status=KeywordStatus.FAILED,
+                            error_type=ErrorType.AUTH_ERROR,
+                            error_message=err_text,
+                            attempts=attempt,
+                        )
+                    raise RuntimeError(err_text)
+
+                related = payload.get("related_queries", {}) or {}
+                rising = self._parse_serpapi_items(
+                    related.get("rising"),
+                    QueryType.RISING,
+                    breakout_threshold,
+                )
+                top = self._parse_serpapi_items(
+                    related.get("top"),
+                    QueryType.TOP,
+                    breakout_threshold,
+                )
+                return KeywordCollectionResult(
+                    keyword=keyword,
+                    status=KeywordStatus.SUCCESS,
+                    rising=rising,
+                    top=top,
+                    attempts=attempt,
+                )
+
+            except Exception as exc:
+                last_error_type = classify_error(exc)
+                last_error_msg = str(exc) or type(exc).__name__
+                logger.warning(
+                    "SerpApi keyword %r failed on attempt %d/%d [%s]: %s",
+                    keyword,
+                    attempt,
+                    max_retries,
+                    last_error_type.value,
+                    last_error_msg,
+                )
+                if attempt < max_retries:
+                    self._sleep(3.0 * attempt)
+
+        return KeywordCollectionResult(
+            keyword=keyword,
+            status=KeywordStatus.FAILED,
+            error_type=last_error_type,
+            error_message=last_error_msg,
+            attempts=max_retries,
+        )
+
+
+def build_collector(
+    config: AppConfig,
+    *,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> TrendsCollector:
+    """Instantiate the configured TrendsCollector provider."""
+    if config.trends.provider == "serpapi":
+        return SerpApiCollector(config, sleep_fn=sleep_fn)
+    return TrendspyCollector(config, sleep_fn=sleep_fn)

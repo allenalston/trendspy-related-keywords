@@ -10,78 +10,21 @@ from pathlib import Path
 import click
 
 from trends_monitor import __version__
-from trends_monitor.collector import TrendspyCollector, resolve_timeframe
+from trends_monitor.collector import build_collector, resolve_timeframe
 from trends_monitor.config import load_config
 from trends_monitor.models import KeywordStatus
 from trends_monitor.notifiers import build_notifiers
+from trends_monitor.presets import PRESETS, get_preset
 from trends_monitor.runner import TrendsMonitorRunner
 from trends_monitor.storage import SQLiteStore
 
-DEFAULT_CONFIG_TEMPLATE = """\
-# TrendSpy Related Keywords Monitor Configuration
-# Sensitive secrets (SMTP password, webhooks, proxy) should go in `.env`.
-
-keywords:
-  - "AI"
-  - "Image"
-  - "Video"
-  - "Music"
-  - "Voice"
-
-trends:
-  timeframe: "now 7-d"
-  geo: ""
-  language: "en"
-  proxy: ""
-
-monitor:
-  rising_threshold: 500
-  breakout_threshold: 5000
-  dedup_days: 7
-  max_items_per_section: 50
-
-rate_limit:
-  min_delay_seconds: 5.0
-  max_delay_seconds: 12.0
-  batch_size: 5
-  batch_interval_seconds: 60.0
-  max_retries: 3
-  quota_backoff_seconds: 60.0
-
-storage:
-  data_dir: "data"
-  db_path: "data/trends_history.sqlite3"
-  save_raw_json: true
-  save_csv: true
-
-notifications:
-  local:
-    enabled: true
-    formats: ["markdown", "html"]
-  email:
-    enabled: false
-    smtp_server: ""
-    smtp_port: 587
-    use_ssl: null
-    sender_email: ""
-    sender_password: ""
-    recipient_emails: []
-    attach_csv: true
-  feishu:
-    enabled: false
-    webhook_url: ""
-  wecom:
-    enabled: false
-    webhook_url: ""
-  webhook:
-    enabled: false
-    url: ""
-    headers: {}
-"""
-
 DEFAULT_ENV_TEMPLATE = """\
-# Optional proxy for Google Trends requests
+# Optional proxy or comma-separated proxy pool for Google Trends requests
 # TRENDS_PROXY=http://127.0.0.1:7890
+# TRENDS_PROXIES=http://user:pass@proxy1:8080,http://user:pass@proxy2:8080
+
+# Optional SerpApi key (only needed when trends.provider is "serpapi")
+# TRENDS_SERPAPI_KEY=
 
 # Optional SMTP settings (only needed when notifications.email.enabled is true)
 TRENDS_SMTP_SERVER=smtp.gmail.com
@@ -114,17 +57,37 @@ def main() -> None:
 @main.command()
 @click.option("--config", "config_path", default="config.yaml", show_default=True, help="Target YAML config path.")
 @click.option("--env", "env_path", default=".env", show_default=True, help="Target .env file path.")
+@click.option(
+    "--preset",
+    default="default",
+    show_default=True,
+    help=f"Starter keyword & filter preset ({', '.join(sorted(PRESETS))}).",
+)
+@click.option("--list-presets", is_flag=True, help="List available starter presets and exit.")
 @click.option("--force", is_flag=True, help="Overwrite existing config files.")
-def init(config_path: str, env_path: str, force: bool) -> None:
-    """Initialize starter `config.yaml` and `.env` files."""
+def init(config_path: str, env_path: str, preset: str, list_presets: bool, force: bool) -> None:
+    """Initialize starter `config.yaml` (with optional preset) and `.env` files."""
+    if list_presets:
+        click.echo("Available presets:")
+        for key in sorted(PRESETS):
+            p = PRESETS[key]
+            click.echo(f"  - {p.name:<14} {p.description}")
+        return
+
+    try:
+        preset_def = get_preset(preset)
+    except ValueError as exc:
+        click.secho(str(exc), fg="red", err=True)
+        sys.exit(2)
+
     cfg_file = Path(config_path)
     env_file = Path(env_path)
 
     if cfg_file.exists() and not force:
         click.echo(f"Skipped {cfg_file} (already exists; use --force to overwrite).")
     else:
-        cfg_file.write_text(DEFAULT_CONFIG_TEMPLATE, encoding="utf-8")
-        click.echo(f"Created {cfg_file}")
+        cfg_file.write_text(preset_def.yaml_content, encoding="utf-8")
+        click.echo(f"Created {cfg_file} (preset: {preset_def.name})")
 
     if env_file.exists() and not force:
         click.echo(f"Skipped {env_file} (already exists; use --force to overwrite).")
@@ -133,9 +96,9 @@ def init(config_path: str, env_path: str, force: bool) -> None:
         click.echo(f"Created {env_file}")
 
     click.echo("\nNext steps:")
-    click.echo(f"  1. Edit {cfg_file} to add your seed keywords.")
+    click.echo(f"  1. Review {cfg_file} and adjust keywords / filters if needed.")
     click.echo("  2. Run `trends-monitor run` to collect data and generate a local digest.")
-    click.echo("  3. Optionally configure email/Feishu/WeCom in `.env` and run `trends-monitor check`.")
+    click.echo("  3. Optionally configure email/Feishu/WeCom or proxies in `.env` and run `trends-monitor check`.")
 
 
 @main.command()
@@ -143,6 +106,8 @@ def init(config_path: str, env_path: str, force: bool) -> None:
 @click.option("-k", "--keywords", multiple=True, help="Override seed keywords (repeatable, e.g. -k AI -k Python).")
 @click.option("--geo", default=None, help="Override region code (e.g. US, JP, or '' for Worldwide).")
 @click.option("--timeframe", default=None, help="Override timeframe (e.g. 'now 1-d', 'now 7-d', 'last-3-d').")
+@click.option("--cat", type=int, default=None, help="Override Google Trends category ID (e.g. 31 for Programming).")
+@click.option("--limit", "max_keywords", type=int, default=None, help="Process at most N pending keywords in this pass (pair with --resume).")
 @click.option("--resume", is_flag=True, help="Resume the latest incomplete run from SQLite checkpoint.")
 @click.option("--run-id", default=None, help="Resume a specific run ID.")
 @click.option("--no-notify", is_flag=True, help="Skip external notifications (email/webhooks); still writes local reports.")
@@ -152,15 +117,16 @@ def run(
     keywords: tuple[str, ...],
     geo: str | None,
     timeframe: str | None,
+    cat: int | None,
+    max_keywords: int | None,
     resume: bool,
     run_id: str | None,
     no_notify: bool,
     verbose: bool,
 ) -> None:
-    """Run a single collection pass, deduplicate against history, and send digest."""
+    """Run a collection pass, deduplicate & filter against history, and send digest."""
     _configure_logging(verbose)
 
-    # Allow frictionless ad-hoc runs with `-k` even if config.yaml hasn't been created yet
     allow_missing = bool(keywords) or resume or bool(run_id)
     try:
         cfg = load_config(config_path, allow_missing=allow_missing)
@@ -180,6 +146,8 @@ def run(
             keywords_override=list(keywords) if keywords else None,
             geo_override=geo,
             timeframe_override=timeframe,
+            cat_override=cat,
+            max_keywords=max_keywords,
             resume=resume,
             run_id=run_id,
             no_notify=no_notify,
@@ -192,14 +160,18 @@ def run(
     report = execution.report
     click.echo("")
     click.secho(f"Run {report.run_id} finished ({execution.status})", bold=True)
+    pending_suffix = f", {report.pending_keywords} pending" if report.pending_keywords else ""
     click.echo(
         f"  Keywords: {report.succeeded_keywords}/{report.total_keywords} succeeded "
-        f"({report.failed_keywords} failed)"
+        f"({report.failed_keywords} failed{pending_suffix})"
     )
+    filter_suffix = f" ({report.filtered_count} noise filtered)" if report.filtered_count else ""
     click.echo(
         f"  Rising signals (>= +{report.rising_threshold}%): "
-        f"{len(report.new_rising)} New, {len(report.recurring_rising)} Recurring"
+        f"{len(report.new_rising)} New, {len(report.recurring_rising)} Recurring{filter_suffix}"
     )
+    if report.pending_keywords > 0:
+        click.echo("  Tip: Run `trends-monitor run --resume` to continue remaining pending keywords.")
     if report.csv_path:
         click.echo(f"  CSV export: {report.csv_path}")
 
@@ -221,16 +193,29 @@ def run(
 @click.option("--probe-keyword", default="Python", show_default=True, help="Keyword used with --live.")
 @click.option("-v", "--verbose", is_flag=True, help="Enable verbose debug logging.")
 def check(config_path: str, live: bool, probe_keyword: str, verbose: bool) -> None:
-    """Validate configuration, storage, notification channels, and optional live Trends access."""
+    """Validate configuration, provider, storage, notifiers, and optional live Trends access."""
     _configure_logging(verbose)
     all_ok = True
 
     try:
         cfg = load_config(config_path, allow_missing=False)
-        click.secho(f"[OK] Config loaded ({len(cfg.keywords)} keywords, timeframe={cfg.trends.timeframe}, geo={cfg.trends.geo or 'Worldwide'})", fg="green")
+        click.secho(
+            f"[OK] Config loaded ({len(cfg.get_keyword_specs())} keywords, "
+            f"provider={cfg.trends.provider}, timeframe={cfg.trends.timeframe}, "
+            f"geo={cfg.trends.geo or 'Worldwide'})",
+            fg="green",
+        )
     except Exception as exc:
         click.secho(f"[FAIL] Config: {exc}", fg="red")
         sys.exit(2)
+
+    collector = build_collector(cfg)
+    ok, msg = collector.check()
+    if ok:
+        click.secho(f"[OK] Collector: {msg}", fg="green")
+    else:
+        click.secho(f"[FAIL] Collector: {msg}", fg="red")
+        all_ok = False
 
     try:
         store = SQLiteStore(cfg.storage.db_path)
@@ -243,18 +228,22 @@ def check(config_path: str, live: bool, probe_keyword: str, verbose: bool) -> No
     if not notifiers:
         click.secho("[WARN] No notification channels are enabled.", fg="yellow")
     for notifier in notifiers:
-        ok, msg = notifier.check()
-        if ok:
-            click.secho(f"[OK] Notifier ({notifier.name}): {msg}", fg="green")
+        n_ok, n_msg = notifier.check()
+        if n_ok:
+            click.secho(f"[OK] Notifier ({notifier.name}): {n_msg}", fg="green")
         else:
-            click.secho(f"[FAIL] Notifier ({notifier.name}): {msg}", fg="red")
+            click.secho(f"[FAIL] Notifier ({notifier.name}): {n_msg}", fg="red")
             all_ok = False
 
     if live:
-        click.echo(f"Running live Google Trends probe for {probe_keyword!r}...")
-        collector = TrendspyCollector(cfg)
+        click.echo(f"Running live Google Trends probe for {probe_keyword!r} via {cfg.trends.provider}...")
         resolved = resolve_timeframe(cfg.trends.timeframe)
-        res = collector.fetch_keyword(probe_keyword, geo=cfg.trends.geo, timeframe=resolved)
+        res = collector.fetch_keyword(
+            probe_keyword,
+            geo=cfg.trends.geo,
+            timeframe=resolved,
+            cat=cfg.trends.cat,
+        )
         if res.status == KeywordStatus.SUCCESS:
             click.secho(
                 f"[OK] Live probe succeeded: {len(res.rising)} rising, {len(res.top)} top queries",
@@ -306,6 +295,7 @@ def notify(config_path: str, run_date: str | None, run_id: str | None, verbose: 
 @click.option("-k", "--keyword", default=None, help="Filter by seed keyword.")
 @click.option("--new-only", is_flag=True, help="Only show queries marked as New.")
 @click.option("--min-value", type=int, default=None, help="Minimum rising growth percentage.")
+@click.option("--min-streak", type=int, default=None, help="Minimum consecutive days observed (e.g. 2).")
 @click.option("--limit", type=int, default=30, show_default=True, help="Maximum rows to display.")
 @click.option("--export", "export_path", default=None, help="Optional CSV path to export matching history.")
 def history(
@@ -313,6 +303,7 @@ def history(
     keyword: str | None,
     new_only: bool,
     min_value: int | None,
+    min_streak: int | None,
     limit: int,
     export_path: str | None,
 ) -> None:
@@ -328,6 +319,7 @@ def history(
         keyword=keyword,
         new_only=new_only,
         min_value=min_value,
+        min_streak=min_streak,
         limit=limit,
     )
 
@@ -345,11 +337,12 @@ def history(
         click.secho(f"Exported {len(rows)} rows to {out}", fg="green")
         return
 
-    click.echo(f"{'Date':<12} {'New':<5} {'Keyword':<14} {'Growth':>10}  {'Related Query'}")
-    click.echo("-" * 76)
+    click.echo(f"{'Date':<12} {'New':<5} {'Streak':<7} {'Keyword':<14} {'Growth':>10}  {'Related Query'}")
+    click.echo("-" * 84)
     for row in rows:
         tag = "NEW" if row["is_new"] else " - "
+        streak = f"{int(row.get('consecutive_days') or 1)}d"
         growth = f"+{row['value']}%" + ("*" if row["is_breakout"] else "")
         click.echo(
-            f"{row['run_date']:<12} {tag:<5} {row['keyword'][:13]:<14} {growth:>10}  {row['related_query']}"
+            f"{row['run_date']:<12} {tag:<5} {streak:<7} {row['keyword'][:13]:<14} {growth:>10}  {row['related_query']}"
         )

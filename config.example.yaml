@@ -1,19 +1,25 @@
 # =============================================================================
-# TrendSpy Related Keywords Monitor Configuration
-# Copy this file to `config.yaml` (or run `trends-monitor init`) and edit it.
-# Sensitive secrets (SMTP password, webhooks, proxy credentials) should go in `.env`.
+# TrendSpy Related Keywords Monitor Configuration (v0.3.0)
+# Copy this file to `config.yaml` (or run `trends-monitor init --preset saas-tools`).
+# Sensitive secrets (SMTP password, webhooks, proxies, API keys) should go in `.env`.
 # =============================================================================
 
-# Fixed seed keywords to monitor
+# Fixed seed keywords to monitor.
+# Supports simple strings or per-keyword objects with optional `cat`, `geo`, and `timeframe`.
 keywords:
-  - "AI"
-  - "Image"
-  - "Video"
-  - "Music"
-  - "Voice"
+  - "generator"
+  - "converter"
+  - "calculator"
+  - keyword: "Python"
+    cat: 31                 # Google Trends category ID (31 = Programming; avoids snake queries!)
+    geo: "US"               # Optional per-keyword region override
 
-# Google Trends query parameters
+# Google Trends query & provider parameters
 trends:
+  # Data provider:
+  #   - "trendspy" (free, unofficial Google Trends client)
+  #   - "serpapi"  (commercial API, zero 429 limits; requires TRENDS_SERPAPI_KEY in .env)
+  provider: "trendspy"
   # Supported formats:
   #   - "now 1-d"       (past 24 hours)
   #   - "now 7-d"       (past 7 days - recommended default)
@@ -25,10 +31,13 @@ trends:
   timeframe: "now 7-d"
   # Country/region code: "" for Worldwide, "US", "GB", "JP", "DE", etc.
   geo: ""
+  # Global Google Trends category ID (0 = All categories; e.g. 5 = Computers & Electronics, 18 = Shopping, 31 = Programming)
+  cat: 0
   # Trends interface language code (e.g., "en", "zh")
   language: "en"
-  # Optional HTTP/SOCKS proxy URL; can also be set via TRENDS_PROXY in .env
-  proxy: ""
+  # Optional proxy pool for automatic rotation on 429/errors;
+  # can also be set via TRENDS_PROXY or comma-separated TRENDS_PROXIES in .env
+  proxies: []
 
 # Signal filtering & deduplication settings
 monitor:
@@ -41,6 +50,19 @@ monitor:
   dedup_days: 7
   # Maximum rows shown per section in the digest report
   max_items_per_section: 50
+
+# Noise-reduction filters applied when generating digest reports
+filters:
+  # Minimum space-separated words (set to 2 to filter out overly broad single-word queries)
+  min_word_count: 1
+  # Case-insensitive regex patterns to exclude obvious non-opportunity noise
+  exclude_patterns:
+    - "\\bdown\\b"
+    - "\\blogin\\b"
+    - "\\bsign in\\b"
+    - "\\bstatus\\b"
+  # Optional whitelist: if non-empty, only queries matching at least one pattern are kept
+  include_patterns: []
 
 # Rate limiting and retry policy (prevents infinite hangs on HTTP 429)
 rate_limit:

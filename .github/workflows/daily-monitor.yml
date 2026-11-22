@@ -49,6 +49,8 @@ jobs:
       - name: Run Trends Monitor
         env:
           TRENDS_PROXY: ${{ secrets.TRENDS_PROXY }}
+          TRENDS_PROXIES: ${{ secrets.TRENDS_PROXIES }}
+          TRENDS_SERPAPI_KEY: ${{ secrets.TRENDS_SERPAPI_KEY }}
           TRENDS_SMTP_SERVER: ${{ secrets.TRENDS_SMTP_SERVER }}
           TRENDS_SMTP_PORT: ${{ secrets.TRENDS_SMTP_PORT }}
           TRENDS_SENDER_EMAIL: ${{ secrets.TRENDS_SENDER_EMAIL }}

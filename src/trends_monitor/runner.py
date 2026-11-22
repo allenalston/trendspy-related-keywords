@@ -1,4 +1,4 @@
-"""Core monitoring pipeline orchestration (collect -> persist -> deduplicate -> report -> notify)."""
+"""Core monitoring pipeline orchestration (collect -> persist -> dedup/filter -> report -> notify)."""
 
 from __future__ import annotations
 
@@ -11,9 +11,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from trends_monitor.collector import TrendsCollector, TrendspyCollector, resolve_timeframe
+from trends_monitor.collector import TrendsCollector, build_collector, resolve_timeframe
 from trends_monitor.config import AppConfig
-from trends_monitor.models import KeywordStatus, NotifyResult, RunReport
+from trends_monitor.filters import QueryFilter
+from trends_monitor.models import KeywordStatus, KeywordTarget, NotifyResult, RunReport
 from trends_monitor.notifiers import BaseNotifier, build_notifiers, dispatch_notifications
 from trends_monitor.storage import SQLiteStore, save_raw_json
 
@@ -31,7 +32,7 @@ class RunExecutionResult:
 
 
 class TrendsMonitorRunner:
-    """Coordinates collection, SQLite persistence, deduplication, and notification dispatch."""
+    """Coordinates collection, SQLite persistence, deduplication, filtering, and notification dispatch."""
 
     def __init__(
         self,
@@ -44,11 +45,71 @@ class TrendsMonitorRunner:
         now_fn: Callable[[], datetime] = datetime.now,
     ) -> None:
         self.config = config
-        self.collector = collector or TrendspyCollector(config, sleep_fn=sleep_fn)
+        self.collector = collector or build_collector(config, sleep_fn=sleep_fn)
         self.store = store or SQLiteStore(config.storage.db_path)
+        self.query_filter = QueryFilter(config.filters)
         self._custom_notifiers = notifiers
         self._sleep = sleep_fn
         self._now = now_fn
+
+    def _build_targets(
+        self,
+        *,
+        now: datetime,
+        keywords_override: list[str] | None,
+        geo_override: str | None,
+        timeframe_override: str | None,
+        cat_override: int | None,
+    ) -> list[KeywordTarget]:
+        default_geo = (
+            geo_override.strip().upper() if geo_override is not None else self.config.trends.geo
+        )
+        default_tf = (
+            timeframe_override if timeframe_override is not None else self.config.trends.timeframe
+        )
+        default_cat = cat_override if cat_override is not None else self.config.trends.cat
+
+        if keywords_override is not None:
+            resolved_tf = resolve_timeframe(default_tf, now=now)
+            return [
+                KeywordTarget(
+                    keyword=kw.strip(),
+                    geo=default_geo,
+                    timeframe=default_tf,
+                    resolved_timeframe=resolved_tf,
+                    cat=default_cat,
+                )
+                for kw in keywords_override
+                if kw.strip()
+            ]
+
+        targets: list[KeywordTarget] = []
+        for spec in self.config.get_keyword_specs():
+            geo = (
+                geo_override.strip().upper()
+                if geo_override is not None
+                else (spec.geo if spec.geo is not None else self.config.trends.geo)
+            )
+            tf = (
+                timeframe_override
+                if timeframe_override is not None
+                else (spec.timeframe if spec.timeframe is not None else self.config.trends.timeframe)
+            )
+            cat = (
+                cat_override
+                if cat_override is not None
+                else (spec.cat if spec.cat is not None else self.config.trends.cat)
+            )
+            targets.append(
+                KeywordTarget(
+                    keyword=spec.keyword,
+                    geo=geo,
+                    timeframe=tf,
+                    resolved_timeframe=resolve_timeframe(tf, now=now),
+                    cat=cat,
+                )
+            )
+        return targets
 
     def run(
         self,
@@ -56,12 +117,14 @@ class TrendsMonitorRunner:
         keywords_override: list[str] | None = None,
         geo_override: str | None = None,
         timeframe_override: str | None = None,
+        cat_override: int | None = None,
+        max_keywords: int | None = None,
         resume: bool = False,
         run_id: str | None = None,
         no_notify: bool = False,
         on_progress: Callable[[int, int, str, str], None] | None = None,
     ) -> RunExecutionResult:
-        """Execute a monitoring run (or resume an incomplete one)."""
+        """Execute a monitoring run (or resume an incomplete one, optionally sharded via max_keywords)."""
         resumed = False
         now = self._now()
 
@@ -79,58 +142,83 @@ class TrendsMonitorRunner:
                 resumed = True
                 active_run_id = str(existing["run_id"])
                 run_date = str(existing["run_date"])
-                timeframe = str(existing["timeframe"])
-                resolved_timeframe = str(existing["resolved_timeframe"])
-                geo = str(existing["geo"])
-                pending_keywords = self.store.get_pending_keywords(active_run_id)
+                pending_targets = self.store.get_pending_targets(active_run_id)
                 logger.info(
                     "Resuming run %s (%d pending/failed keywords remaining)",
                     active_run_id,
-                    len(pending_keywords),
+                    len(pending_targets),
                 )
 
         if not resumed:
-            keywords = keywords_override if keywords_override is not None else list(self.config.keywords)
-            if not keywords:
+            targets = self._build_targets(
+                now=now,
+                keywords_override=keywords_override,
+                geo_override=geo_override,
+                timeframe_override=timeframe_override,
+                cat_override=cat_override,
+            )
+            if not targets:
                 raise ValueError("No keywords configured. Add keywords to config.yaml or pass --keywords.")
-            timeframe = timeframe_override if timeframe_override is not None else self.config.trends.timeframe
-            resolved_timeframe = resolve_timeframe(timeframe, now=now)
-            geo = geo_override.strip().upper() if geo_override is not None else self.config.trends.geo
+            run_tf = timeframe_override if timeframe_override is not None else self.config.trends.timeframe
+            run_resolved_tf = resolve_timeframe(run_tf, now=now)
+            run_geo = geo_override.strip().upper() if geo_override is not None else self.config.trends.geo
             run_date = now.strftime("%Y-%m-%d")
             active_run_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-            pending_keywords = keywords
+            pending_targets = targets
 
             self.store.create_run(
                 run_id=active_run_id,
                 run_date=run_date,
-                keywords=keywords,
-                timeframe=timeframe,
-                resolved_timeframe=resolved_timeframe,
-                geo=geo,
+                targets=targets,
+                timeframe=run_tf,
+                resolved_timeframe=run_resolved_tf,
+                geo=run_geo,
                 rising_threshold=self.config.monitor.rising_threshold,
             )
+
+        if max_keywords is not None and max_keywords > 0:
+            pending_targets = pending_targets[:max_keywords]
 
         output_dir = Path(self.config.storage.data_dir) / run_date
         output_dir.mkdir(parents=True, exist_ok=True)
 
         batch_size = self.config.rate_limit.batch_size
-        total_pending = len(pending_keywords)
+        total_pending = len(pending_targets)
 
-        for idx, keyword in enumerate(pending_keywords, start=1):
-            logger.info("[%d/%d] Querying keyword %r (geo=%s, timeframe=%s)", idx, total_pending, keyword, geo or "Worldwide", resolved_timeframe)
-            result = self.collector.fetch_keyword(keyword, geo=geo, timeframe=resolved_timeframe)
+        for idx, target in enumerate(pending_targets, start=1):
+            logger.info(
+                "[%d/%d] Querying keyword %r (geo=%s, timeframe=%s, cat=%d)",
+                idx,
+                total_pending,
+                target.keyword,
+                target.geo or "Worldwide",
+                target.resolved_timeframe,
+                target.cat,
+            )
+            result = self.collector.fetch_keyword(
+                target.keyword,
+                geo=target.geo,
+                timeframe=target.resolved_timeframe,
+                cat=target.cat,
+            )
 
             self.store.record_keyword_result(
                 run_id=active_run_id,
                 run_date=run_date,
-                geo=geo,
-                timeframe=resolved_timeframe,
+                geo=target.geo,
+                timeframe=target.resolved_timeframe,
                 result=result,
                 dedup_days=self.config.monitor.dedup_days,
             )
 
             if self.config.storage.save_raw_json and result.status == KeywordStatus.SUCCESS:
-                save_raw_json(output_dir, result, geo=geo, timeframe=resolved_timeframe)
+                save_raw_json(
+                    output_dir,
+                    result,
+                    geo=target.geo,
+                    timeframe=target.resolved_timeframe,
+                    cat=target.cat,
+                )
 
             if on_progress:
                 detail = (
@@ -138,9 +226,8 @@ class TrendsMonitorRunner:
                     if result.status == KeywordStatus.SUCCESS
                     else f"{result.error_type.value if result.error_type else 'error'}: {result.error_message}"
                 )
-                on_progress(idx, total_pending, keyword, f"{result.status.value} ({detail})")
+                on_progress(idx, total_pending, target.keyword, f"{result.status.value} ({detail})")
 
-            # Pacing delays between requests and batches
             if idx < total_pending:
                 if idx % batch_size == 0 and self.config.rate_limit.batch_interval_seconds > 0:
                     wait = self.config.rate_limit.batch_interval_seconds + random.uniform(0.0, 5.0)
@@ -166,6 +253,7 @@ class TrendsMonitorRunner:
         report = self.store.build_run_report(
             active_run_id,
             max_items_per_section=self.config.monitor.max_items_per_section,
+            query_filter=self.query_filter,
             csv_path=csv_path,
             output_dir=output_dir,
         )
@@ -174,7 +262,6 @@ class TrendsMonitorRunner:
             notifiers = [] if no_notify else self._custom_notifiers
         else:
             if no_notify:
-                # Still allow local file export so CLI users get their digest on disk
                 notifiers = [n for n in build_notifiers(self.config) if n.name == "local"]
             else:
                 notifiers = build_notifiers(self.config)
@@ -215,6 +302,7 @@ class TrendsMonitorRunner:
         report = self.store.build_run_report(
             active_run_id,
             max_items_per_section=self.config.monitor.max_items_per_section,
+            query_filter=self.query_filter,
             csv_path=csv_path,
             output_dir=output_dir,
         )

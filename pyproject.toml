@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "trendspy-related-keywords"
-version = "0.2.0"
+version = "0.3.0"
 description = "An open-source Google Trends rising related keywords monitor with deduplication, resume support, and daily digest reports."
 readme = "README.md"
 license = { text = "MIT" }

@@ -22,7 +22,19 @@ class ErrorType(str, Enum):
     QUOTA_EXCEEDED = "quota_exceeded"
     EMPTY_RESPONSE = "empty_response"
     NETWORK_ERROR = "network_error"
+    AUTH_ERROR = "auth_error"
     UNKNOWN_ERROR = "unknown_error"
+
+
+@dataclass(frozen=True)
+class KeywordTarget:
+    """Resolved seed keyword target with effective geo, timeframe, and Google Trends category."""
+
+    keyword: str
+    geo: str = ""
+    timeframe: str = "now 7-d"
+    resolved_timeframe: str = "now 7-d"
+    cat: int = 0
 
 
 @dataclass(frozen=True)
@@ -57,9 +69,20 @@ class RisingSignal:
     value: int
     is_breakout: bool
     is_new: bool
+    geo: str = ""
     seen_count: int = 1
+    consecutive_days: int = 1
+    previous_value: int | None = None
     previous_max_value: int | None = None
     first_seen_date: str | None = None
+
+    @property
+    def is_accelerating(self) -> bool:
+        return self.previous_value is not None and self.value > self.previous_value
+
+    @property
+    def is_streak(self) -> bool:
+        return self.consecutive_days >= 2
 
 
 @dataclass(frozen=True)
@@ -85,6 +108,8 @@ class RunReport:
     total_keywords: int
     succeeded_keywords: int
     failed_keywords: int
+    pending_keywords: int = 0
+    filtered_count: int = 0
     new_rising: list[RisingSignal] = field(default_factory=list)
     recurring_rising: list[RisingSignal] = field(default_factory=list)
     failures: list[FailedKeywordItem] = field(default_factory=list)

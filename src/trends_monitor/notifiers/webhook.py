@@ -14,7 +14,13 @@ from trends_monitor.config import (
 )
 from trends_monitor.models import NotifyResult, RunReport
 from trends_monitor.notifiers.base import BaseNotifier
-from trends_monitor.report import build_subject, format_growth, trends_explore_url
+from trends_monitor.report import (
+    build_subject,
+    format_growth,
+    format_momentum_tags,
+    google_search_url,
+    trends_explore_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +38,12 @@ def _build_compact_markdown(report: RunReport, *, max_items: int = 15, max_bytes
     if report.new_rising:
         lines.append("**✨ New Rising Queries**")
         for item in report.new_rising[:max_items]:
-            url = trends_explore_url(item.related_query, report.geo)
-            lines.append(f"- `{item.keyword}` → [{item.related_query}]({url}) (**{format_growth(item)}**)")
+            geo = item.geo or report.geo
+            t_url = trends_explore_url(item.related_query, geo)
+            g_url = google_search_url(item.related_query)
+            lines.append(
+                f"- `{item.keyword}` → [{item.related_query}]({t_url}) (**{format_growth(item)}**) · [Google]({g_url})"
+            )
         if len(report.new_rising) > max_items:
             lines.append(f"- _...and {len(report.new_rising) - max_items} more new signals_")
         lines.append("")
@@ -44,8 +54,10 @@ def _build_compact_markdown(report: RunReport, *, max_items: int = 15, max_bytes
         top_rec = report.recurring_rising[: min(5, max_items)]
         lines.append("**📈 Top Recurring Rising**")
         for item in top_rec:
+            tags = format_momentum_tags(item)
+            tag_str = f" {' '.join(tags)}" if tags else ""
             lines.append(
-                f"- `{item.keyword}` → {item.related_query} ({format_growth(item)}, seen {item.seen_count}x)"
+                f"- `{item.keyword}` → {item.related_query} ({format_growth(item)}, seen {item.seen_count}x{tag_str})"
             )
         lines.append("")
 
@@ -208,6 +220,8 @@ class GenericWebhookNotifier(BaseNotifier):
                 "total_keywords": report.total_keywords,
                 "succeeded_keywords": report.succeeded_keywords,
                 "failed_keywords": report.failed_keywords,
+                "pending_keywords": report.pending_keywords,
+                "filtered_count": report.filtered_count,
                 "new_rising_count": len(report.new_rising),
                 "recurring_rising_count": len(report.recurring_rising),
             },
@@ -217,7 +231,8 @@ class GenericWebhookNotifier(BaseNotifier):
                     "related_query": item.related_query,
                     "value": item.value,
                     "is_breakout": item.is_breakout,
-                    "explore_url": trends_explore_url(item.related_query, report.geo),
+                    "explore_url": trends_explore_url(item.related_query, item.geo or report.geo),
+                    "google_url": google_search_url(item.related_query),
                 }
                 for item in report.new_rising
             ],
@@ -228,6 +243,9 @@ class GenericWebhookNotifier(BaseNotifier):
                     "value": item.value,
                     "is_breakout": item.is_breakout,
                     "seen_count": item.seen_count,
+                    "consecutive_days": item.consecutive_days,
+                    "previous_value": item.previous_value,
+                    "is_accelerating": item.is_accelerating,
                     "previous_max_value": item.previous_max_value,
                     "first_seen_date": item.first_seen_date,
                 }
